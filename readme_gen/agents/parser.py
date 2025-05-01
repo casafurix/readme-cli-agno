@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Set
 
 from agno.agent import Agent
-from agno.memory.short_term_memory import ShortTermMemory
-from agno.tools.base import BaseTool
+from agno.memory.v2.memory import Memory
 from pydantic import BaseModel, Field
 
 
@@ -33,155 +32,166 @@ class ProjectData(BaseModel):
     root_path: Path
 
 
-class ParseFileTool(BaseTool):
-    """Tool for parsing a Python file."""
+def parse_file(file_path: Path, project_data: ProjectData) -> None:
+    """Parse a Python file to extract classes, functions, docstrings, and examples.
 
-    name = "parse_file"
-    description = "Parse a Python file to extract classes, functions, docstrings, and examples."
+    Args:
+        file_path: Path to the Python file
+        project_data: ProjectData to update
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
 
-    def run(self, file_path: Path, project_data: ProjectData) -> None:
-        """
-        Parse a Python file and update the project data.
+        # Parse the file with AST
+        module = ast.parse(content)
+        module_name = file_path.stem
 
-        Args:
-            file_path: Path to the Python file
-            project_data: ProjectData to update
-        """
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+        # Add module to project data
+        relative_path = file_path.relative_to(project_data.root_path)
+        module_id = str(relative_path).replace(
+            '/', '.').replace('\\', '.').replace('.py', '')
 
-            # Parse the file with AST
-            module = ast.parse(content)
-            module_name = file_path.stem
+        # Extract module docstring
+        module_docstring = ast.get_docstring(module)
 
-            # Add module to project data
-            relative_path = file_path.relative_to(project_data.root_path)
-            module_id = str(relative_path).replace(
-                '/', '.').replace('\\', '.').replace('.py', '')
+        project_data.items[module_id] = CodeItem(
+            name=module_id,
+            type="module",
+            docstring=module_docstring,
+            file_path=file_path,
+        )
 
-            # Extract module docstring
-            module_docstring = ast.get_docstring(module)
+        # Keep track of functions that are methods
+        method_nodes = set()
 
-            project_data.items[module_id] = CodeItem(
-                name=module_id,
-                type="module",
-                docstring=module_docstring,
-                file_path=file_path,
-            )
+        # First identify all method nodes (functions within classes)
+        for node in ast.walk(module):
+            if isinstance(node, ast.ClassDef):
+                for child_node in node.body:
+                    if isinstance(child_node, ast.FunctionDef):
+                        method_nodes.add(child_node)
 
-            # Extract classes and functions
-            for node in ast.walk(module):
-                if isinstance(node, ast.ClassDef):
-                    class_id = f"{module_id}.{node.name}"
-                    class_docstring = ast.get_docstring(node)
+        # Extract classes and functions
+        for node in ast.walk(module):
+            if isinstance(node, ast.ClassDef):
+                class_id = f"{module_id}.{node.name}"
+                class_docstring = ast.get_docstring(node)
 
-                    project_data.items[class_id] = CodeItem(
-                        name=node.name,
-                        type="class",
-                        docstring=class_docstring,
-                        file_path=file_path,
-                        parent=module_id,
-                        signature=f"class {node.name}",
-                    )
+                project_data.items[class_id] = CodeItem(
+                    name=node.name,
+                    type="class",
+                    docstring=class_docstring,
+                    file_path=file_path,
+                    parent=module_id,
+                    signature=f"class {node.name}",
+                )
 
-                    if module_id in project_data.items:
-                        project_data.items[module_id].children.append(class_id)
+                if module_id in project_data.items:
+                    project_data.items[module_id].children.append(class_id)
 
-                    # Extract methods
-                    for child_node in node.body:
-                        if isinstance(child_node, ast.FunctionDef):
-                            method_id = f"{class_id}.{child_node.name}"
-                            method_docstring = ast.get_docstring(child_node)
+                # Extract methods
+                for child_node in node.body:
+                    if isinstance(child_node, ast.FunctionDef):
+                        method_id = f"{class_id}.{child_node.name}"
+                        method_docstring = ast.get_docstring(child_node)
 
-                            # Build signature
-                            params = []
-                            for param in child_node.args.args:
-                                if param.arg != 'self' and param.arg != 'cls':
-                                    params.append(param.arg)
+                        # Build signature
+                        params = []
+                        for param in child_node.args.args:
+                            if param.arg != 'self' and param.arg != 'cls':
+                                params.append(param.arg)
 
-                            method_signature = f"def {child_node.name}({', '.join(['self'] + params)})"
+                        method_signature = f"def {child_node.name}({', '.join(['self'] + params)})"
 
-                            project_data.items[method_id] = CodeItem(
-                                name=child_node.name,
-                                type="function",
-                                docstring=method_docstring,
-                                file_path=file_path,
-                                parent=class_id,
-                                signature=method_signature,
-                            )
+                        project_data.items[method_id] = CodeItem(
+                            name=child_node.name,
+                            type="function",
+                            docstring=method_docstring,
+                            file_path=file_path,
+                            parent=class_id,
+                            signature=method_signature,
+                        )
 
-                            if class_id in project_data.items:
-                                project_data.items[class_id].children.append(
-                                    method_id)
+                        if class_id in project_data.items:
+                            project_data.items[class_id].children.append(
+                                method_id)
 
-                elif isinstance(node, ast.FunctionDef) and node.parent_field != 'body':
-                    # Only top-level functions
-                    func_id = f"{module_id}.{node.name}"
-                    func_docstring = ast.get_docstring(node)
+            elif isinstance(node, ast.FunctionDef) and node not in method_nodes:
+                # Only top-level functions that are not methods
+                func_id = f"{module_id}.{node.name}"
+                func_docstring = ast.get_docstring(node)
 
-                    # Build signature
-                    params = [param.arg for param in node.args.args]
-                    func_signature = f"def {node.name}({', '.join(params)})"
+                # Build signature
+                params = [param.arg for param in node.args.args]
+                func_signature = f"def {node.name}({', '.join(params)})"
 
-                    project_data.items[func_id] = CodeItem(
-                        name=node.name,
-                        type="function",
-                        docstring=func_docstring,
-                        file_path=file_path,
-                        parent=module_id,
-                        signature=func_signature,
-                    )
+                project_data.items[func_id] = CodeItem(
+                    name=node.name,
+                    type="function",
+                    docstring=func_docstring,
+                    file_path=file_path,
+                    parent=module_id,
+                    signature=func_signature,
+                )
 
-                    if module_id in project_data.items:
-                        project_data.items[module_id].children.append(func_id)
+                if module_id in project_data.items:
+                    project_data.items[module_id].children.append(func_id)
 
-            # Look for examples in docstrings
-            for item_id, item in project_data.items.items():
-                if item.docstring:
-                    examples = self._extract_examples(item.docstring)
-                    if examples:
-                        item.examples.extend(examples)
+        # Look for examples in docstrings
+        for item_id, item in project_data.items.items():
+            if item.docstring:
+                examples = _extract_examples(item.docstring)
+                if examples:
+                    item.examples.extend(examples)
 
-        except Exception as e:
-            # Skip files that can't be parsed
-            print(f"Error parsing {file_path}: {str(e)}")
+    except Exception as e:
+        # Skip files that can't be parsed
+        print(f"Error parsing {file_path}: {str(e)}")
 
-    def _extract_examples(self, docstring: str) -> List[str]:
-        """Extract code examples from a docstring."""
-        examples = []
-        if "example" in docstring.lower() or "examples" in docstring.lower():
-            lines = docstring.split('\n')
-            in_example = False
-            current_example = []
 
-            for line in lines:
-                # Check for example section headers or code blocks
-                if "example" in line.lower() or line.strip().startswith('>>>'):
-                    in_example = True
+def _extract_examples(docstring: str) -> List[str]:
+    """Extract code examples from a docstring."""
+    examples = []
+    if "example" in docstring.lower() or "examples" in docstring.lower():
+        lines = docstring.split('\n')
+        in_example = False
+        current_example = []
 
-                if in_example:
-                    current_example.append(line)
+        for line in lines:
+            # Check for example section headers or code blocks
+            if "example" in line.lower() or line.strip().startswith('>>>'):
+                in_example = True
 
-                # End of example block
-                if in_example and line.strip() == '' and current_example:
-                    examples.append('\n'.join(current_example))
-                    current_example = []
-                    in_example = False
+            if in_example:
+                current_example.append(line)
 
-            # Catch any remaining example
-            if current_example:
+            # End of example block
+            if in_example and line.strip() == '' and current_example:
                 examples.append('\n'.join(current_example))
+                current_example = []
+                in_example = False
 
-        return examples
+        # Catch any remaining example
+        if current_example:
+            examples.append('\n'.join(current_example))
+
+    return examples
 
 
 class ParserAgent(Agent):
     """Agent for parsing Python projects."""
 
-    def __init__(self, memory: ShortTermMemory):
-        super().__init__(memory=memory)
-        self.tools = [ParseFileTool()]
+    def __init__(self, memory: Memory):
+        # Get model from memory
+        model = memory.model
+
+        # Initialize with the model and memory
+        super().__init__(
+            model=model,
+            memory=memory,
+            instructions="You are a technical documentation expert who parses Python projects."
+        )
 
     def parse_project(self, project_path: Path) -> ProjectData:
         """
@@ -219,7 +229,8 @@ class ParserAgent(Agent):
         python_files = self._find_python_files(project_path)
 
         for file_path in python_files:
-            self.tools[0].run(file_path, project_data)
+            # Use the parse_file function directly
+            parse_file(file_path, project_data)
 
         return project_data
 

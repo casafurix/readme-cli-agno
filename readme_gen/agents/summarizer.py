@@ -1,11 +1,14 @@
 """Summarizer agent for generating human-friendly descriptions using Agno and LLMs."""
 
 from typing import Dict, List, Optional
+import io
+import sys
+import time
+from contextlib import redirect_stdout
 
 from agno.agent import Agent
-from agno.llms.openai import OpenAILLM
-from agno.memory.short_term_memory import ShortTermMemory
-from agno.tools.base import BaseTool
+from agno.models.openai import OpenAIChat
+from agno.memory.v2.memory import Memory
 from pydantic import BaseModel
 
 from readme_gen.agents.parser import ProjectData, CodeItem
@@ -20,45 +23,58 @@ class Summary(BaseModel):
     usage_examples: List[str] = []
 
 
-class SummarizeTool(BaseTool):
-    """Tool for summarizing code items using LLMs."""
+# Global LLM instance to be used by the summarize function
+_llm = None
 
-    name = "summarize_code"
-    description = "Summarize code items using LLMs to generate human-friendly descriptions."
 
-    def __init__(self, llm_model: Optional[str] = None):
-        super().__init__()
-        # Use model provided or get from environment
-        model = llm_model or get_openai_model()
+def get_llm(model_name: Optional[str] = None):
+    """Get or create a global LLM instance."""
+    global _llm
+    if _llm is None:
+        model = model_name or get_openai_model()
         api_key = get_openai_api_key()
-        self.llm = OpenAILLM(model=model, api_key=api_key)
+        _llm = OpenAIChat(id=model, api_key=api_key)
+    return _llm
 
-    def run(self, item: CodeItem) -> Summary:
-        """
-        Summarize a code item using LLMs.
 
-        Args:
-            item: CodeItem to summarize
+def summarize_code(item: CodeItem) -> Summary:
+    """Summarize code items using LLMs to generate human-friendly descriptions.
 
-        Returns:
-            Summary object with descriptions and examples
-        """
-        prompt = self._build_prompt(item)
-        response = self.llm.predict(prompt)
+    Args:
+        item: CodeItem to summarize
 
-        summary = self._parse_response(response, item.name)
-        summary.item_id = item.name
+    Returns:
+        Summary object with descriptions and examples
+    """
+    # Create a temporary agent for summarization
+    prompt = _build_prompt(item)
 
-        # Add examples from docstring if available
-        if item.examples:
-            summary.usage_examples.extend(item.examples)
+    # Create a temporary agent for this specific summarization task
+    llm = get_llm()
+    summarizer = Agent(
+        model=llm,
+        instructions=prompt
+    )
 
-        return summary
+    # Get response from the agent
+    response = summarizer.get_response("Summarize the provided code.")
+    response_text = response.content if response else ""
 
-    def _build_prompt(self, item: CodeItem) -> str:
-        """Build a prompt for the LLM based on the code item."""
-        prompt = f"""You are a technical documentation expert.
-        
+    # Parse the response
+    summary = _parse_response(response_text, item.name)
+    summary.item_id = item.name
+
+    # Add examples from docstring if available
+    if item.examples:
+        summary.usage_examples.extend(item.examples)
+
+    return summary
+
+
+def _build_prompt(item: CodeItem) -> str:
+    """Build a prompt for the LLM based on the code item."""
+    prompt = f"""You are a technical documentation expert.
+    
 Given the following Python {item.type}, please provide:
 1. A concise one-line description
 2. A more detailed explanation of what it does and its purpose
@@ -75,87 +91,100 @@ EXAMPLE: <code example if possible>
 
 Focus on clarity and usefulness for developers."""
 
-        return prompt
+    return prompt
 
-    def _parse_response(self, response: str, item_name: str) -> Summary:
-        """Parse the LLM response into a Summary object."""
-        lines = response.strip().split('\n')
 
-        short_desc = ""
-        detailed_desc = ""
-        examples = []
+def _parse_response(response: str, item_name: str) -> Summary:
+    """Parse the LLM response into a Summary object."""
+    lines = response.strip().split('\n')
 
-        current_section = None
-        current_content = []
+    short_desc = ""
+    detailed_desc = ""
+    examples = []
 
-        for line in lines:
-            line = line.strip()
-            if line.startswith("SHORT:"):
-                if current_section and current_content:
-                    if current_section == "SHORT":
-                        short_desc = "\n".join(current_content).strip()
-                    elif current_section == "DETAILED":
-                        detailed_desc = "\n".join(current_content).strip()
-                    elif current_section == "EXAMPLE":
-                        examples.append("\n".join(current_content).strip())
+    current_section = None
+    current_content = []
 
-                current_section = "SHORT"
-                current_content = [line.replace("SHORT:", "").strip()]
+    for line in lines:
+        line = line.strip()
+        if line.startswith("SHORT:"):
+            if current_section and current_content:
+                if current_section == "SHORT":
+                    short_desc = "\n".join(current_content).strip()
+                elif current_section == "DETAILED":
+                    detailed_desc = "\n".join(current_content).strip()
+                elif current_section == "EXAMPLE":
+                    examples.append("\n".join(current_content).strip())
 
-            elif line.startswith("DETAILED:"):
-                if current_section and current_content:
-                    if current_section == "SHORT":
-                        short_desc = "\n".join(current_content).strip()
-                    elif current_section == "DETAILED":
-                        detailed_desc = "\n".join(current_content).strip()
-                    elif current_section == "EXAMPLE":
-                        examples.append("\n".join(current_content).strip())
+            current_section = "SHORT"
+            current_content = [line.replace("SHORT:", "").strip()]
 
-                current_section = "DETAILED"
-                current_content = [line.replace("DETAILED:", "").strip()]
+        elif line.startswith("DETAILED:"):
+            if current_section and current_content:
+                if current_section == "SHORT":
+                    short_desc = "\n".join(current_content).strip()
+                elif current_section == "DETAILED":
+                    detailed_desc = "\n".join(current_content).strip()
+                elif current_section == "EXAMPLE":
+                    examples.append("\n".join(current_content).strip())
 
-            elif line.startswith("EXAMPLE:"):
-                if current_section and current_content:
-                    if current_section == "SHORT":
-                        short_desc = "\n".join(current_content).strip()
-                    elif current_section == "DETAILED":
-                        detailed_desc = "\n".join(current_content).strip()
-                    elif current_section == "EXAMPLE":
-                        examples.append("\n".join(current_content).strip())
+            current_section = "DETAILED"
+            current_content = [line.replace("DETAILED:", "").strip()]
 
-                current_section = "EXAMPLE"
-                current_content = [line.replace("EXAMPLE:", "").strip()]
+        elif line.startswith("EXAMPLE:"):
+            if current_section and current_content:
+                if current_section == "SHORT":
+                    short_desc = "\n".join(current_content).strip()
+                elif current_section == "DETAILED":
+                    detailed_desc = "\n".join(current_content).strip()
+                elif current_section == "EXAMPLE":
+                    examples.append("\n".join(current_content).strip())
 
-            else:
-                current_content.append(line)
+            current_section = "EXAMPLE"
+            current_content = [line.replace("EXAMPLE:", "").strip()]
 
-        # Handle the last section
-        if current_section and current_content:
-            if current_section == "SHORT":
-                short_desc = "\n".join(current_content).strip()
-            elif current_section == "DETAILED":
-                detailed_desc = "\n".join(current_content).strip()
-            elif current_section == "EXAMPLE":
-                examples.append("\n".join(current_content).strip())
+        else:
+            current_content.append(line)
 
-        # Default short description if empty
-        if not short_desc:
-            short_desc = f"Python {item_name}"
+    # Handle the last section
+    if current_section and current_content:
+        if current_section == "SHORT":
+            short_desc = "\n".join(current_content).strip()
+        elif current_section == "DETAILED":
+            detailed_desc = "\n".join(current_content).strip()
+        elif current_section == "EXAMPLE":
+            examples.append("\n".join(current_content).strip())
 
-        return Summary(
-            item_id=item_name,
-            short_description=short_desc,
-            detailed_description=detailed_desc,
-            usage_examples=examples,
-        )
+    # Default short description if empty
+    if not short_desc:
+        short_desc = f"Python {item_name}"
+
+    return Summary(
+        item_id=item_name,
+        short_description=short_desc,
+        detailed_description=detailed_desc,
+        usage_examples=examples,
+    )
 
 
 class SummarizerAgent(Agent):
     """Agent for summarizing Python code items."""
 
-    def __init__(self, memory: ShortTermMemory, model: Optional[str] = None):
-        super().__init__(memory=memory)
-        self.tools = [SummarizeTool(llm_model=model)]
+    def __init__(self, memory: Memory, model: Optional[str] = None):
+        # Set up the OpenAI model
+        model_name = model or get_openai_model()
+        api_key = get_openai_api_key()
+
+        print(f"SummarizerAgent: Using model {model_name}")
+
+        llm = OpenAIChat(id=model_name, api_key=api_key)
+
+        # Pass the model to the parent Agent constructor
+        super().__init__(
+            model=llm,
+            memory=memory,
+            instructions="You are a technical documentation expert who summarizes Python code items."
+        )
 
     def generate_summaries(self, project_data: ProjectData) -> Dict[str, Summary]:
         """
@@ -168,15 +197,65 @@ class SummarizerAgent(Agent):
             Dictionary mapping item IDs to their summaries
         """
         summaries = {}
+        total_items = sum(1 for item in project_data.items.values()
+                          if item.type in ["module", "class", "function"])
+
+        print(f"Generating summaries for {total_items} items...")
+        sys.stdout.flush()
+
+        item_count = 0
+        error_count = 0
 
         # Process items by type - modules first, then classes, then functions
         for item_type in ["module", "class", "function"]:
             for item_id, item in project_data.items.items():
                 if item.type == item_type:
                     try:
-                        summary = self.tools[0].run(item)
+                        item_count += 1
+                        print(
+                            f"[{item_count}/{total_items}] Summarizing {item_id}...")
+                        sys.stdout.flush()
+
+                        start_time = time.time()
+
+                        # Create a prompt for this specific item
+                        prompt = _build_prompt(item)
+
+                        # Use Agent's ask method to get a response
+                        response = ""
+                        try:
+                            # Capture the output from print_response as it prints to stdout
+                            output = io.StringIO()
+                            with redirect_stdout(output):
+                                # Use the built-in print_response method
+                                self.print_response(prompt, stream=False)
+                            response = output.getvalue()
+                        except Exception as api_error:
+                            print(f"API error: {str(api_error)}")
+                            # Fallback to basic description
+                            response = f"SHORT: {item.type.capitalize()}: {item.name}\nDETAILED: {item.docstring if item.docstring else ''}"
+
+                        # Parse the response
+                        summary = _parse_response(response, item.name)
+                        summary.item_id = item.name
+
+                        # Add examples from docstring if available
+                        if item.examples:
+                            summary.usage_examples.extend(
+                                item.examples)
+
                         summaries[item_id] = summary
+
+                        if item_count % 10 == 0:
+                            print(
+                                f"Completed {item_count}/{total_items} summaries.")
+                            sys.stdout.flush()
+
+                        end_time = time.time()
+                        print(
+                            f"Summarizing {item_id} took {end_time - start_time:.2f} seconds")
                     except Exception as e:
+                        error_count += 1
                         print(f"Error summarizing {item_id}: {str(e)}")
                         # Create a basic summary as fallback
                         summaries[item_id] = Summary(
@@ -184,4 +263,6 @@ class SummarizerAgent(Agent):
                             short_description=f"{item.type.capitalize()}: {item.name}",
                         )
 
+        print(
+            f"Summary generation complete. {item_count} items processed with {error_count} errors.")
         return summaries

@@ -68,8 +68,12 @@ def main(
     if env_file:
         load_env_vars(env_file)
 
-    # Use model from argument or environment
-    selected_model = model or get_openai_model()
+    # If model is specified in CLI, set it in environment
+    if model:
+        os.environ["OPENAI_MODEL"] = model
+
+    # Get the model we're using for the display message
+    selected_model = get_openai_model()
 
     abs_path = path.absolute()
     console.print(
@@ -79,7 +83,6 @@ def main(
     try:
         readme_content = generate_readme(
             project_path=abs_path,
-            model=selected_model,
         )
 
         if preview:
@@ -87,7 +90,20 @@ def main(
             console.print(readme_content)
             console.print("\n[italic]Preview only - not saving to file[/]")
         else:
+            # Determine output filename based on whether README.md already exists
             output_path = abs_path / output
+
+            # If output file already exists and is README.md, use README_AGNO.md instead
+            if output_path.exists() and output_path.name.lower() == "readme.md":
+                # Get the stem (filename without extension) and extension
+                stem = output_path.stem
+                suffix = output_path.suffix
+                # Create new filename with _AGNO appended before the extension
+                new_filename = f"{stem}_AGNO{suffix}"
+                output_path = abs_path / new_filename
+                console.print(
+                    f"[yellow]README.md already exists. Using {new_filename} instead.[/]")
+
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(readme_content)
             console.print(
